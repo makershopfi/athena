@@ -1,0 +1,201 @@
+# Split deploy, Athena side: just Athena + MariaDB, no ESPHome dashboard - use this when you want
+# ESPHome's own compiles (a full ESP-IDF toolchain download + native build per device, CPU/RAM
+# heavy) to happen on a separate, beefier machine instead of this one. Run
+# docker-compose-esphome.yml on that other machine, then point ESPHOME_CONFIG_DIR (below) and
+# ESPHOME_DASHBOARD_URL (in .env) at it - see both files' own comments for the full picture.
+#
+# For an all-in-one single-machine deploy instead (Athena + MariaDB + ESPHome bundled together),
+# use docker-compose-with-esphome.yml instead of this file.
+#
+# Put this file and .env (copied from .env.example) in the same folder, then run
+# `docker compose up -d`. The athena service imports its own database schema on first boot
+# against the empty MariaDB instance below - no separate schema file to run by hand, same
+# self-migrating approach ZenBooks' own deploy uses.
+#
+# Uses the pre-built image - run ./build-docker.sh <tag> first (or set TAG to one already
+# published to a registry). Defaults to "latest" if TAG isn't set.
+
+services:
+  mariadb:
+    image: mariadb:11
+    container_name: athena-mariadb
+    environment:
+      - MARIADB_DATABASE=${DB_NAME:-athena}
+      - MARIADB_USER=${DB_USER:-athena}
+      - MARIADB_PASSWORD=${DB_PASSWORD:?set DB_PASSWORD in .env}
+      - MARIADB_ROOT_PASSWORD=${DB_ROOT_PASSWORD:?set DB_ROOT_PASSWORD in .env}
+    volumes:
+      - db-data:/var/lib/mysql
+    healthcheck:
+      # --innodb_initialized specifically (not just --connect) matters on a *first* boot against
+      # an empty volume: the server can already be accepting connections while MariaDB's own
+      # first-boot initialization is still running, which briefly restarts mysqld partway
+      # through - a plain --connect check can report healthy in that gap, right before the
+      # restart drops it again.
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+    # Loopback-only - athena itself reaches this via 127.0.0.1 (see its own DB_HOST below), since
+    # host networking (also below) means it has no compose-network DNS to resolve "mariadb" by
+    # service name anymore. Not bound to the LAN - nothing outside this host can reach it.
+    ports:
+      - "127.0.0.1:3306:3306"
+
+  # Bundled MQTT broker for auto-discovery (see MQTT_BROKER_URL below). Unlike mariadb above -
+  # only athena itself ever talks to that - real hardware on the LAN (Tasmota, Zigbee2MQTT,
+  # ESPHome's own native mqtt component, ...) needs to reach this broker directly to publish its
+  # own discovery/state messages, so it's published on all interfaces, not just 127.0.0.1.
+  # Anonymous access allowed by default (see mosquitto.conf) - same "typical install is a trusted
+  # LAN, not the open internet" reasoning ATHENA_SECURE_COOKIES's own default off is built on.
+  # Compiling firmware is the heavy part of the all-in-one deploy this split exists to move off
+  # this machine (see the top-of-file comment) - running a broker isn't, so it's bundled here too
+  # rather than needing its own split file.
+  mosquitto:
+    container_name: athena-mosquitto
+    image: eclipse-mosquitto:2
+    volumes:
+      # :z relabels the host bind mount for container access under SELinux (Fedora/RHEL/CentOS
+      # hosts) - without it, mosquitto fails to start at all ("Unable to open config file"),
+      # reproduced directly against this exact bind-mount pattern on an SELinux-enforcing host,
+      # same root cause as the ESPHome sidecar's own :z (see docker-compose-with-esphome.yml).
+      # No-op on hosts without SELinux.
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro,z
+      - mosquitto-data:/mosquitto/data
+    ports:
+      - "1883:1883"
+    restart: unless-stopped
+
+  athena:
+    container_name: athena
+    image: makershop/athena:${TAG:-latest}
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    # Discovering ESPHome devices on the LAN needs real multicast (mDNS) visibility, which
+    # Docker's default bridge network never gets - same reason ESPHome's own dashboard container
+    # runs this way. This also means no compose-network service-name DNS ("mariadb" below becomes
+    # 127.0.0.1, reached via the port mariadb now publishes above) and no more ports: mapping -
+    # athena binds straight to the host's own PORT.
+    network_mode: host
+    environment:
+      - DB_HOST=127.0.0.1
+      - DB_PORT=3306
+      - DB_NAME=${DB_NAME:-athena}
+      - DB_USER=${DB_USER:-athena}
+      - DB_PASSWORD=${DB_PASSWORD:?set DB_PASSWORD in .env}
+      # With host networking there's no more ports: mapping to remap this through - PORT (set in
+      # .env) is now the actual host port Athena binds directly.
+      - PORT=${PORT:-8000}
+      # true skips serving the web UI entirely, leaving only /api/* alive - for installs driven
+      # purely through the API (another automation system, a mobile app, a headless SBC with no
+      # reason to serve a browser UI).
+      - ATHENA_HEADLESS=${ATHENA_HEADLESS:-false}
+      # Only set this true if you're actually terminating HTTPS in front of Athena (a reverse
+      # proxy, or a load balancer) - the session cookie's Secure flag otherwise blocks login
+      # entirely over plain HTTP, which is the common case for a LAN-only self-hosted install.
+      - ATHENA_SECURE_COOKIES=${ATHENA_SECURE_COOKIES:-false}
+      - ESPHOME_CONFIG_DIR=/config
+      # No built-in service to point at (there's no esphome container in this compose network) -
+      # set this in .env to the OTHER machine's own address, e.g.
+      # http://192.168.1.50:6052 - matching whatever docker-compose-esphome.yml publishes there.
+      # Leaving it unset just disables the Compile/Validate buttons (device YAML editing and the
+      # file manager below still work either way, since those only need filesystem access).
+      - ESPHOME_DASHBOARD_URL=${ESPHOME_DASHBOARD_URL:-}
+      # Must match whatever docker-compose-esphome.yml requires the other machine's dashboard to
+      # authenticate with - that file makes these mandatory, since (unlike the bundled sidecar)
+      # its dashboard has a port published on the network, not just reachable over a private
+      # compose network.
+      - ESPHOME_DASHBOARD_USERNAME=${ESPHOME_DASHBOARD_USERNAME:-}
+      - ESPHOME_DASHBOARD_PASSWORD=${ESPHOME_DASHBOARD_PASSWORD:-}
+      # Reaches the bundled mosquitto service above via 127.0.0.1, same reason as
+      # ESPHOME_DASHBOARD_URL above (host networking means no compose-network DNS). Leave
+      # MQTT_BROKER_URL blank in .env to disable MQTT auto-discovery entirely, or point it at a
+      # different broker if you'd rather not use the bundled one.
+      - MQTT_BROKER_URL=${MQTT_BROKER_URL:-tcp://127.0.0.1:1883}
+      - MQTT_USERNAME=${MQTT_USERNAME:-}
+      - MQTT_PASSWORD=${MQTT_PASSWORD:-}
+      - MQTT_DISCOVERY_PREFIX=${MQTT_DISCOVERY_PREFIX:-homeassistant}
+      # "Forgot password" on the login page - see .env.example's own comment. Works out of the box
+      # (defaults to the real domos.fi relay, no secret to configure - this install registers its
+      # own credential with it automatically). Blank URL, or PASSWORD_RESET_DISABLED=true, turns
+      # it off entirely.
+      - PASSWORD_RESET_RELAY_URL=${PASSWORD_RESET_RELAY_URL:-}
+      - PASSWORD_RESET_DISABLED=${PASSWORD_RESET_DISABLED:-}
+    volumes:
+      # Same bind-mount-not-named-volume convention as db-data above: docker-compose.yml lives on
+      # real disk, the host's own root may not. For the split deploy this path should be a
+      # network share (NFS/CIFS/etc.) mounted at the host level, at the exact same effective
+      # location docker-compose-esphome.yml's own ./esphome-config bind mount resolves to on the
+      # other machine - Docker itself doesn't do anything cross-host here, it's just bind-mounting
+      # whatever's already at this host path, same as any local directory.
+      #
+      # :z relabels the host directory for container access under SELinux (Fedora/RHEL/CentOS
+      # hosts) - without it, a host with SELinux enforcing denies writes here entirely
+      # (confirmed directly: reproduced a real write-permission crash in ESPHome's own dashboard
+      # tooling against this exact bind-mount pattern on an SELinux-enforcing host, fixed by
+      # adding this flag). No-op on hosts without SELinux.
+      - ./esphome-config:/config:z
+      # Lets the container's own local time (used wherever Region settings' own Timezone field is
+      # left unset - see config.RegionHolder.Location) match the host's real timezone by default,
+      # same convention Home Assistant's own docker-compose uses - the runtime image itself has no
+      # timezone configured at all otherwise. Read-only; safe to remove on a host that doesn't have
+      # /etc/localtime (rare, but not universal - Docker would otherwise create an empty directory
+      # there instead of failing outright, which breaks this rather than just skipping it, so
+      # comment this line out if that ever happens rather than leaving it to fail silently).
+      - /etc/localtime:/etc/localtime:ro
+      # Bluetooth LE - shared by every BLE-based integration (RuuviTag/internal/ruuviapi,
+      # BTHome/internal/bthomeapi, IKEA IDÅSEN desk/internal/idasenapi, LD2410 presence sensor/
+      # internal/ld2410api, and the generic Bluetooth device tracker/internal/bluetoothapi) - all
+      # of them subscribe to the one shared scan loop in internal/blescan, which talks to BlueZ
+      # over the host's own D-Bus system bus - a separate Unix socket, not something
+      # network_mode: host above already grants access to. This mount is what actually gets a
+      # container process onto that bus. Host-dependent and unverified against real hardware: the
+      # runtime image runs as root (no USER directive in the Dockerfile), which likely satisfies
+      # BlueZ's default D-Bus policy, but that isn't guaranteed on every host (e.g. rootless
+      # Docker, or a host with a locked-down D-Bus policy file) - if BLE devices never come
+      # online, check `docker logs athena` for a D-Bus/BlueZ permission error first. Comment this
+      # line out entirely if you use none of the BLE integrations above and would rather not
+      # grant it.
+      - /var/run/dbus:/var/run/dbus
+    # Direct EZSP-over-serial to a bare Silicon Labs Zigbee coordinator (internal/zigbeeapi,
+    # transport "ezsp") needs the host's own serial device node passed through - Docker doesn't
+    # expose USB/serial devices by default the way network_mode: host exposes network interfaces.
+    # Commented out by default since the exact device path varies by host/adapter (check
+    # `ls /dev/serial/by-id/` for a stable name instead of /dev/ttyUSB0, which can shift across
+    # reboots if more than one USB-serial adapter is plugged in) - uncomment and adjust before
+    # adding an EZSP gateway in the UI. Not needed at all for the deCONZ transport, which talks to
+    # its own REST+WebSocket API over the network instead.
+    # devices:
+    #   - /dev/ttyUSB0:/dev/ttyUSB0
+    restart: unless-stopped
+
+  # Terminates HTTPS in front of athena so browsers see a secure context - required for
+  # WebUSB/WebSerial (microcontroller flashing) to work at all, since browsers refuse those APIs
+  # over plain http://. See Caddyfile for how the cert is provisioned. Set
+  # ATHENA_SECURE_COOKIES=true in .env once this is running, or the login cookie's Secure flag
+  # will reject sessions reaching athena through it.
+  caddy:
+    image: caddy:2-alpine
+    container_name: athena-caddy
+    # Reaches athena via 127.0.0.1 (see Caddyfile), same as mariadb above - host networking so it
+    # can bind straight on the LAN interface.
+    network_mode: host
+    environment:
+      - PORT=${PORT:-8000}
+      # Defaults to 8443, not 443 - see Caddyfile's own comment on why (443 is commonly already
+      # taken by another service on the host, and WebUSB/WebSerial don't care which port it's on).
+      - HTTPS_PORT=${HTTPS_PORT:-8443}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    restart: unless-stopped
+
+volumes:
+  db-data:
+  mosquitto-data:
+  caddy-data:
+  caddy-config:
