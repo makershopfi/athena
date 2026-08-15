@@ -1,0 +1,41 @@
+# Terminates HTTPS for Athena on the LAN so browsers treat it as a secure context (WebUSB/WebSerial,
+# used by the flashing UI, refuse to run over plain http://). `tls internal` has Caddy generate its
+# own local CA on first run and mint a leaf cert from it automatically - no certs to create by hand.
+# Both are persisted in the caddy-data volume so they survive container restarts.
+#
+# Browsers will show a "not secure" warning on first visit since that CA isn't in their trust store -
+# WebUSB/WebSerial only require the https:// scheme, not a publicly-trusted cert, so this is enough
+# to unblock flashing. To remove the warning on a given device, export the CA from the container
+# (docker exec athena-caddy cat /data/caddy/pki/authorities/local/root.crt) and install it as a
+# trusted root there.
+#
+# HTTPS_PORT defaults to 8443, not 443 - this proxy runs on network_mode: host (see
+# docker-compose.yml), so it binds straight onto the host's own network interfaces, and 443 is
+# often already taken by another service on that same host. WebUSB/WebSerial's secure-context
+# check only cares about the https:// scheme, not which port it's on, so any port works - set
+# HTTPS_PORT in .env to whatever's actually free.
+#
+# disable_redirects: by default Caddy also opens a plain-HTTP listener on :80 to redirect to
+# HTTPS, even for a bare "no hostname" site block like this one - that collides with port 80
+# already being in use by another service on the same host (the same reason HTTPS_PORT itself
+# isn't 443), and redirecting is pointless here anyway since nothing is meant to reach this on
+# :80 in the first place.
+{
+	auto_https disable_redirects
+}
+
+:{$HTTPS_PORT:8443} {
+  # on_demand: this site block has no hostname (just a bare port, since it's reached by
+  # whatever LAN IP/hostname each device uses), so plain "tls internal" has nothing to pre-issue
+  # a certificate for and every handshake fails with a generic TLS "internal error" - confirmed
+  # by testing directly against the built image. on_demand makes Caddy mint (and cache) a
+  # leaf cert for whatever hostname/IP each incoming connection's SNI actually asks for,
+  # signed by the same local CA. Safe to leave unrestricted (no "ask" endpoint) specifically
+  # because the internal issuer is offline/local-only - unlike on-demand with a public CA,
+  # there's no external rate limit or quota an attacker could exhaust by requesting certs for
+  # many different names.
+  tls internal {
+    on_demand
+  }
+  reverse_proxy 127.0.0.1:{$PORT:-8000}
+}
