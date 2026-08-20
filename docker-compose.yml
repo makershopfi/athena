@@ -15,6 +15,16 @@ services:
       - MARIADB_USER=${DB_USER:-athena}
       - MARIADB_PASSWORD=${DB_PASSWORD:?set DB_PASSWORD in .env}
       - MARIADB_ROOT_PASSWORD=${DB_ROOT_PASSWORD:?set DB_ROOT_PASSWORD in .env}
+    # innodb-buffer-pool-size: the mariadb image's own default (128MB) is fine for a fresh install,
+    # but device_state_events and its ~48 per-integration siblings keep growing for as long as
+    # history retention allows (up to 730 days) - a real report confirmed a ~4M-row table on a
+    # default-tuned instance taking 9-10s to answer a single entity's history query even with the
+    # correct index chosen, because every matched row still needs its own random lookup into the
+    # InnoDB clustered table, and a busy multi-device install's own constant write traffic never
+    # let a 128MB pool stay warm. 512M is still modest against typical self-hosted RAM (a
+    # Raspberry Pi 4/5 with 4GB+) while comfortably outgrowing the default; DB_INNODB_BUFFER_POOL_SIZE
+    # lets anyone with tighter RAM or a much larger install tune it without editing this file.
+    command: --innodb-buffer-pool-size=${DB_INNODB_BUFFER_POOL_SIZE:-512M}
     volumes:
       - ./mysql:/var/lib/mysql
     healthcheck:
