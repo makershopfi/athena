@@ -1,0 +1,246 @@
+# Named docker-compose-athena.yml rather than the auto-discovered docker-compose.yml since this
+# folder holds several independent stacks side by side (see the sibling docker-compose-*.yml
+# files - Z-Wave/deCONZ/Zigbee2MQTT sidecars, each its own separate deploy, typically on whichever
+# machine the USB stick is physically plugged into). Always pass -f explicitly:
+#
+#   docker compose -f docker-compose-athena.yml up -d
+#
+# Put this file and .env (copied from .env.example) in the same folder first. The athena service
+# imports its own database schema on first boot against the empty MariaDB instance below - no
+# separate schema file to run by hand, same self-migrating approach ZenBooks' own deploy uses.
+#
+# Uses the pre-built image - run ./build-docker.sh <tag> first (or set TAG to one already
+# published to a registry). Defaults to "latest" if TAG isn't set.
+
+services:
+  mariadb:
+    image: mariadb:11
+    container_name: athena-mariadb
+    environment:
+      - MARIADB_DATABASE=${DB_NAME:-athena}
+      - MARIADB_USER=${DB_USER:-athena}
+      - MARIADB_PASSWORD=${DB_PASSWORD:?set DB_PASSWORD in .env}
+      - MARIADB_ROOT_PASSWORD=${DB_ROOT_PASSWORD:?set DB_ROOT_PASSWORD in .env}
+    # innodb-buffer-pool-size: the mariadb image's own default (128MB) is fine for a fresh install,
+    # but device_state_events and its ~48 per-integration siblings (internal/db/schema.sql) grow
+    # continuously for as long as history retention allows (settings.go's own retentionDays, up to
+    # 730 days) - a real report confirmed a ~4M-row table on a default-tuned instance taking 9-10s
+    # to answer a single entity's history query even with the correct index chosen and only ~37k
+    # matching rows: every one of those rows still needs its own random lookup into the InnoDB
+    # clustered table for entity_name/domain/state_value (a secondary index can't cover a TEXT
+    # column), and with a busy multi-device install writing across every other entity's own rows
+    # continuously, a 128MB pool never stays warm long enough to help - confirmed directly (a
+    # second, identical query moments later was exactly as slow as the first). 512M is still modest
+    # against typical self-hosted RAM (a Raspberry Pi 4/5 with 4GB+) while comfortably outgrowing
+    # the default; DB_INNODB_BUFFER_POOL_SIZE lets anyone with tighter RAM or a much larger install
+    # tune it without editing this file.
+    command: --innodb-buffer-pool-size=${DB_INNODB_BUFFER_POOL_SIZE:-512M}
+    volumes:
+      # Bind-mounted (not a named volume) so the database files sit right next to this compose
+      # file on real disk - easier to see, back up, or move than reaching into Docker's own
+      # volume storage.
+      - ./mysql:/var/lib/mysql
+    healthcheck:
+      # --innodb_initialized specifically (not just --connect) matters on a *first* boot against
+      # an empty volume: the server can already be accepting connections while MariaDB's own
+      # first-boot initialization is still running, which briefly restarts mysqld partway
+      # through - a plain --connect check can report healthy in that gap, right before the
+      # restart drops it again.
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+    # Loopback-only - athena itself reaches this via 127.0.0.1 (see its own DB_HOST below), since
+    # host networking (also below) means it has no compose-network DNS to resolve "mariadb" by
+    # service name anymore. Not bound to the LAN - nothing outside this host can reach it.
+    ports:
+      - "127.0.0.1:3306:3306"
+
+  athena:
+    container_name: athena
+    image: makershop/athena:${TAG:-latest}
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    # Discovering ESPHome devices on the LAN needs real multicast (mDNS) visibility, which
+    # Docker's default bridge network never gets - same reason ESPHome's own dashboard container
+    # runs this way. This also means no compose-network service-name DNS ("mariadb" below becomes
+    # 127.0.0.1, reached via the port mariadb now publishes above) and no more ports: mapping -
+    # athena binds straight to the host's own PORT (here, ATHENA_PORT).
+    network_mode: host
+    environment:
+      - DB_HOST=127.0.0.1
+      - DB_PORT=3306
+      - DB_NAME=${DB_NAME:-athena}
+      - DB_USER=${DB_USER:-athena}
+      - DB_PASSWORD=${DB_PASSWORD:?set DB_PASSWORD in .env}
+      # With host networking there's no more ports: mapping to remap this through - PORT is now
+      # the actual host port Athena binds directly (named ATHENA_PORT here, not PORT, since this
+      # folder's own Caddy/phpMyAdmin services each need their own distinct port variable too).
+      - PORT=${ATHENA_PORT:-8000}
+      # true skips serving the web UI entirely, leaving only /api/* alive - for installs driven
+      # purely through the API (another automation system, a mobile app, a headless SBC with no
+      # reason to serve a browser UI).
+      - ATHENA_HEADLESS=${ATHENA_HEADLESS:-false}
+      # Only set this true if you're actually terminating HTTPS in front of Athena (the bundled
+      # caddy service below, or another reverse proxy/load balancer) - the session cookie's Secure
+      # flag otherwise blocks login entirely over plain HTTP, which is the common case for a
+      # LAN-only self-hosted install.
+      - ATHENA_SECURE_COOKIES=${ATHENA_SECURE_COOKIES:-false}
+      - ESPHOME_CONFIG_DIR=/config
+      # Where Athena's own rotating copy of its log lives (see internal/alog.EnableFileLogging) -
+      # backs the Configuration -> Logs page's recent activity across a container restart, on top
+      # of what's already in memory. Bind-mounted below (./logs, matching this folder's own
+      # bind-mount-everything convention) so it survives a container recreate too, not just a
+      # restart.
+      - LOG_DIR=/data/logs
+      # No built-in service to point at (there's no esphome container in this compose network) -
+      # set this in .env to the OTHER machine's own address, e.g.
+      # http://192.168.1.50:6052 - matching whatever docker-compose-esphome.yml publishes there.
+      # Leaving it unset just disables the Compile/Validate buttons (device YAML editing and the
+      # file manager below still work either way, since those only need filesystem access).
+      - ESPHOME_DASHBOARD_URL=${ESPHOME_DASHBOARD_URL:-}
+      # Must match whatever docker-compose-esphome.yml requires the other machine's dashboard to
+      # authenticate with - that file makes these mandatory, since (unlike a bundled sidecar)
+      # its dashboard has a port published on the network, not just reachable over a private
+      # compose network.
+      - ESPHOME_DASHBOARD_USERNAME=${ESPHOME_DASHBOARD_USERNAME:-}
+      - ESPHOME_DASHBOARD_PASSWORD=${ESPHOME_DASHBOARD_PASSWORD:-}
+      # No broker bundled in this file (see docker-compose-zigbee2mqtt.yml if you're also running
+      # that, or point this at your own already-running broker) - blank by default, which disables
+      # MQTT auto-discovery entirely until set.
+      - MQTT_BROKER_URL=${MQTT_BROKER_URL:-}
+      - MQTT_USERNAME=${MQTT_USERNAME:-}
+      - MQTT_PASSWORD=${MQTT_PASSWORD:-}
+      - MQTT_DISCOVERY_PREFIX=${MQTT_DISCOVERY_PREFIX:-homeassistant}
+      # "Forgot password" on the login page - see .env.example's own comment. Works out of the box
+      # (defaults to the real domos.fi relay, no secret to configure - this install registers its
+      # own credential with it automatically). Blank URL, or PASSWORD_RESET_DISABLED=true, turns
+      # it off entirely.
+      - PASSWORD_RESET_RELAY_URL=${PASSWORD_RESET_RELAY_URL:-}
+      - PASSWORD_RESET_DISABLED=${PASSWORD_RESET_DISABLED:-}
+      # Self-update - see the athena service's own volumes: comment below on the two commented-out
+      # mounts this pairs with. Left blank (the default) hides the "Update" button entirely
+      # (GET /api/system-info's own selfUpdateAvailable) and self_update.go's handler 400s if
+      # reached directly anyway - "Restart" needs neither this nor those two mounts.
+      - ATHENA_DEPLOY_DIR=${ATHENA_DEPLOY_DIR:-}
+    volumes:
+      # :z relabels the host directory for container access under SELinux (Fedora/RHEL/CentOS
+      # hosts) - without it, a host with SELinux enforcing denies writes here entirely
+      # (confirmed directly: reproduced a real write-permission crash in ESPHome's own dashboard
+      # tooling against this exact bind-mount pattern on an SELinux-enforcing host, fixed by
+      # adding this flag). No-op on hosts without SELinux.
+      - ../esphome-config:/config:z
+      # LOG_DIR above - bind-mounted (not a named volume), matching this folder's own convention
+      # of keeping everything on real disk right next to the compose file.
+      - ./logs:/data/logs
+      # Lets the container's own local time (used wherever Region settings' own Timezone field is
+      # left unset - see config.RegionHolder.Location) match the host's real timezone by default,
+      # same convention Home Assistant's own docker-compose uses - the runtime image itself has no
+      # timezone configured at all otherwise. Read-only; safe to remove on a host that doesn't have
+      # /etc/localtime (rare, but not universal - Docker would otherwise create an empty directory
+      # there instead of failing outright, which breaks this rather than just skipping it, so
+      # comment this line out if that ever happens rather than leaving it to fail silently).
+      - /etc/localtime:/etc/localtime:ro
+      # Bluetooth LE - shared by every BLE-based integration (RuuviTag/internal/ruuviapi,
+      # BTHome/internal/bthomeapi, IKEA IDÅSEN desk/internal/idasenapi, LD2410 presence sensor/
+      # internal/ld2410api, and the generic Bluetooth device tracker/internal/bluetoothapi) - all
+      # of them subscribe to the one shared scan loop in internal/blescan, which talks to BlueZ
+      # over the host's own D-Bus system bus - a separate Unix socket, not something
+      # network_mode: host above already grants access to. This mount is what actually gets a
+      # container process onto that bus. Host-dependent and unverified against real hardware: the
+      # runtime image runs as root (no USER directive in the Dockerfile), which likely satisfies
+      # BlueZ's default D-Bus policy, but that isn't guaranteed on every host (e.g. rootless
+      # Docker, or a host with a locked-down D-Bus policy file) - if BLE devices never come
+      # online, check `docker logs athena` for a D-Bus/BlueZ permission error first. Comment this
+      # line out entirely if you use none of the BLE integrations above and would rather not
+      # grant it.
+      - /var/run/dbus:/var/run/dbus
+      # Self-update ("System info" page's own "Update" button, backend/internal/api/self_update.go)
+      # shells out to the real `docker compose` CLI (installed in the runtime image - see
+      # Dockerfile) against the host's own dockerd over this socket, driving `docker compose pull`
+      # / `up -d` exactly as if an operator typed it by hand. Commented out by default, same
+      # convention as the EZSP serial device below - granting a container root-equivalent access
+      # to the host's Docker socket is a real security boundary crossing, not something any
+      # install should get without deliberately opting in. Uncomment both this line and the one
+      # below, and set ATHENA_DEPLOY_DIR in .env to this file's own absolute host directory
+      # (matters because `docker compose` resolves every OTHER relative volume path in this same
+      # file - like ../esphome-config above - against its current working directory before
+      # sending them to the daemon over this socket; if that directory isn't mounted at the
+      # identical absolute path inside the container too, `docker compose up -d` run from in here
+      # would ask the host daemon to bind-mount a path that doesn't exist on the host). Also pass
+      # `--project-name athena` (or set COMPOSE_PROJECT_NAME=athena) so the auto-update command
+      # this triggers matches whatever project name this stack was originally brought up under -
+      # "Restart" (the other button on that same card) needs neither of these two lines - it's
+      # just this process exiting under restart: unless-stopped below.
+      # - /var/run/docker.sock:/var/run/docker.sock
+      # - ${ATHENA_DEPLOY_DIR}:${ATHENA_DEPLOY_DIR}:z
+    # Direct EZSP-over-serial to a bare Silicon Labs Zigbee coordinator (internal/zigbeeapi,
+    # transport "ezsp") needs the host's own serial device node passed through - Docker doesn't
+    # expose USB/serial devices by default the way network_mode: host exposes network interfaces.
+    # Commented out by default since the exact device path varies by host/adapter - uncomment and
+    # adjust one of the two options below before adding an EZSP gateway in the UI. Not needed at
+    # all for the deCONZ transport (see docker-compose-deconz.yml), which talks to its own
+    # REST+WebSocket API over the network instead.
+    #
+    # Option A - pin one specific stick (simplest, matches most single-stick setups):
+    # devices:
+    #   # Use /dev/serial/by-id/... (see `ls /dev/serial/by-id/`), not /dev/ttyUSB0 - by-id is
+    #   # keyed off the stick's own USB vendor/product/serial, so it still finds the same
+    #   # physical stick after a reboot or after moving it to a different port, unlike
+    #   # /dev/ttyUSB0's plain enumeration order (which shifts if more than one USB-serial
+    #   # adapter is plugged in). Docker still resolves this to one fixed device node at
+    #   # container start though - unplugging the stick and plugging it back in usually keeps
+    #   # working (the kernel typically reuses the same underlying device number for the same
+    #   # port), but isn't guaranteed, and a stick that's unplugged at container start (or
+    #   # swapped for a different one) needs `docker compose up -d` run again to pick it up.
+    #   - /dev/serial/by-id/<your-stick-here>:/dev/ttyUSB0
+    #
+    # Option B - real hot-plug support (unplug/replug, or swap to a different stick, with no
+    # container restart): grants access to every USB-serial device node instead of one pinned
+    # path, so whichever one shows up under either driver family always works.
+    # devices:
+    #   - /dev:/dev
+    # device_cgroup_rules:
+    #   - 'c 188:* rmw'  # ttyUSB* - FTDI/CP210x/CH340-style USB-serial adapters
+    #   - 'c 166:* rmw'  # ttyACM* - USB CDC-ACM, e.g. many ESP32/Silicon Labs dev boards
+    restart: unless-stopped
+
+  # phpMyAdmin - optional direct DB access/inspection alongside Athena's own Environment page.
+  # Not published to the LAN by default beyond whatever PHPMYADMIN_PORT you set - treat it the
+  # same as the bundled MariaDB port above, LAN-trusted access only.
+  phpmyadmin:
+    container_name: athena-phpmyadmin
+    image: phpmyadmin/phpmyadmin:latest
+    restart: unless-stopped
+    depends_on:
+      - mariadb
+    environment:
+      PMA_HOST: mariadb
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:?set DB_ROOT_PASSWORD in .env}
+    ports:
+      - ${PHPMYADMIN_PORT:-6066}:80
+
+  # Terminates HTTPS in front of athena so browsers see a secure context - required for
+  # WebUSB/WebSerial (microcontroller flashing) to work at all, since browsers refuse those APIs
+  # over plain http://. See Caddyfile for how the cert is provisioned. Set
+  # ATHENA_SECURE_COOKIES=true in .env once this is running, or the login cookie's Secure flag
+  # will reject sessions reaching athena through it.
+  caddy:
+    image: caddy:2-alpine
+    container_name: athena-caddy
+    # Reaches athena via 127.0.0.1 (see Caddyfile), same as mariadb above - host networking so it
+    # can bind straight on the LAN interface.
+    network_mode: host
+    environment:
+      - PORT=${CADDY_PORT:-8000}
+      # Defaults to 8443, not 443 - see Caddyfile's own comment on why (443 is commonly already
+      # taken by another service on the host, and WebUSB/WebSerial don't care which port it's on).
+      - HTTPS_PORT=${HTTPS_PORT:-8443}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy/caddy-data:/data
+      - ./caddy/caddy-config:/config
+    restart: unless-stopped

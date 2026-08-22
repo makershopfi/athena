@@ -1,0 +1,42 @@
+# zwave-js-ui (bundles zwave-js-server, the WebSocket protocol Athena's own Z-Wave integration
+# connects to) - not part of the athena stack itself, run this on whichever machine the Z-Wave
+# USB stick is physically plugged into (any Z-Wave stick works, including Home Assistant's own
+# Connect ZWA-2). Independent of docker-compose-athena.yml - can live in this same folder, or its
+# own, on a different host entirely.
+#
+# Put this file and .env (copied from .env.example) in the same folder, then:
+#   docker compose -f docker-compose-zwave.yml up -d
+# Then open http://<this-host>:8091 once to run Z-Wave JS UI's own setup wizard (it auto-detects
+# the stick over /dev/zwave and enables its bundled Z-Wave JS server automatically). From then on,
+# Athena only ever needs the WebSocket port below - the web UI is just for pairing new devices and
+# isn't required to be reachable for Athena itself to work.
+
+services:
+  zwave-js-ui:
+    container_name: zwave-js-ui
+    image: zwavejs/zwave-js-ui:latest
+    restart: unless-stopped
+    tty: true
+    stop_signal: SIGINT
+    # Option A - pin one specific stick (simplest, matches most single-stick setups). Docker
+    # resolves this to one fixed device node at container start, so unplugging the stick (or
+    # swapping it for a different one) isn't guaranteed to keep working without running
+    # `docker compose up -d` again.
+    devices:
+      - ${ZWAVE_STICK_DEVICE:?set ZWAVE_STICK_DEVICE in .env}:/dev/zwave
+    #
+    # Option B - real hot-plug support instead (unplug/replug, or swap to a different stick, with
+    # no container restart): comment out the devices: block above and use this instead, plus point
+    # ZWAVE_STICK_DEVICE at the stable by-id path in .env (not a plain /dev/ttyACM0) - with the
+    # whole host /dev visible, that symlink is visible inside the container too.
+    # devices:
+    #   - /dev:/dev
+    # device_cgroup_rules:
+    #   - 'c 166:* rmw'  # ttyACM* - USB CDC-ACM, e.g. most Z-Wave sticks including the Connect ZWA-2
+    volumes:
+      # Bind-mounted (not a named volume) so the network's own pairing/config data sits right
+      # next to this compose file on real disk.
+      - ./zwave-js-ui-store:/usr/src/app/store
+    ports:
+      - '${ZWAVE_UI_PORT:-8091}:8091'  # Z-Wave JS UI's own web UI - pairing wizard, network map
+      - '${ZWAVE_WS_PORT:-3000}:3000'  # the actual zwave-js-server websocket - this is the port Athena connects to

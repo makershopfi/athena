@@ -1,0 +1,42 @@
+# Zigbee2MQTT - Athena has no dedicated integration for this and doesn't need one: Zigbee2MQTT
+# publishes Home Assistant's own MQTT discovery convention by default, and Athena's MQTT
+# integration already implements that same convention, so every Zigbee gateway/device it manages
+# shows up automatically once both point at the same broker. Not part of the athena stack itself,
+# run this on whichever machine the Zigbee coordinator (a CC2531/CC2652/ConBee/Sonoff dongle,
+# etc.) is physically plugged into. Independent of docker-compose-athena.yml - can live in this
+# same folder, or its own, on a different host entirely.
+#
+# Put this file, .env (copied from .env.zigbee2mqtt.example), and ./data/configuration.yaml
+# (copied from configuration.yaml.example, alongside this file) in the same folder, then:
+#   docker compose -f docker-compose-zigbee2mqtt.yml up -d
+# Then open http://<this-host>:8080 to pair Zigbee devices onto the network.
+
+services:
+  zigbee2mqtt:
+    container_name: zigbee2mqtt
+    image: ghcr.io/koenkk/zigbee2mqtt
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
+      - /run/udev:/run/udev:ro
+    ports:
+      - '${ZIGBEE2MQTT_PORT:-8080}:8080'  # Zigbee2MQTT's own web frontend - device pairing, network map
+    environment:
+      - TZ=${TZ:-Europe/Helsinki}
+    # Option A - pin one specific stick (simplest, matches most single-stick setups). Docker
+    # resolves this to one fixed device node at container start, so unplugging the stick (or
+    # swapping it for a different one) isn't guaranteed to keep working without running
+    # `docker compose up -d` again.
+    devices:
+      - ${ZIGBEE2MQTT_STICK_DEVICE:?set ZIGBEE2MQTT_STICK_DEVICE in .env}:/dev/ttyACM0
+    #
+    # Option B - real hot-plug support instead (unplug/replug, or swap to a different stick, with
+    # no container restart): comment out the devices: block above and use this instead, plus point
+    # serial.port in ./data/configuration.yaml at the stable by-id path directly (not
+    # /dev/ttyACM0) - with the whole host /dev visible, that symlink is visible inside the
+    # container too.
+    # devices:
+    #   - /dev:/dev
+    # device_cgroup_rules:
+    #   - 'c 188:* rmw'  # ttyUSB* - CP210x/CH340-style adapters (some CC2531 dongles)
+    #   - 'c 166:* rmw'  # ttyACM* - USB CDC-ACM (CC2652/ConBee/Sonoff-style adapters)

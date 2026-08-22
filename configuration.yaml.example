@@ -1,0 +1,20 @@
+# Copy this file to ./data/configuration.yaml (create the ./data folder first) before the first
+# `docker compose -f docker-compose-zigbee2mqtt.yml up -d` - Zigbee2MQTT reads it on startup.
+
+# This is the setting that makes devices show up in Athena automatically - Athena's own MQTT
+# integration already implements Home Assistant's own discovery convention.
+homeassistant: true
+
+mqtt:
+  server: 'mqtt://<your-broker-host>:1883'
+  # user/password only if your broker requires auth - a broker with anonymous access allowed
+  # (Mosquitto's own default with no password_file configured) needs neither.
+  # user: mqtt-user
+  # password: mqtt-password
+
+serial:
+  # Must match whatever the active devices: mapping in docker-compose-zigbee2mqtt.yml targets -
+  # /dev/ttyACM0 for Option A (that file's own default); the stable by-id path itself (not
+  # /dev/ttyACM0) if you switch to Option B, since Zigbee2MQTT otherwise has no way to find the
+  # stick again after it re-enumerates under a different name.
+  port: /dev/ttyACM0
