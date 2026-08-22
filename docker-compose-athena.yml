@@ -96,6 +96,9 @@ services:
       # bind-mount-everything convention) so it survives a container recreate too, not just a
       # restart.
       - LOG_DIR=/data/logs
+      # Where an uploaded kind="subprocess" Plugin's own executable lands (Configuration > Plugins
+      # > Subprocess plugins) - bind-mounted below (./plugin-bins), same convention as LOG_DIR above.
+      - PLUGIN_BIN_DIR=/data/plugin-bins
       # No built-in service to point at (there's no esphome container in this compose network) -
       # set this in .env to the OTHER machine's own address, e.g.
       # http://192.168.1.50:6052 - matching whatever docker-compose-esphome.yml publishes there.
@@ -136,6 +139,8 @@ services:
       # LOG_DIR above - bind-mounted (not a named volume), matching this folder's own convention
       # of keeping everything on real disk right next to the compose file.
       - ./logs:/data/logs
+      # PLUGIN_BIN_DIR above.
+      - ./plugin-bins:/data/plugin-bins
       # Lets the container's own local time (used wherever Region settings' own Timezone field is
       # left unset - see config.RegionHolder.Location) match the host's real timezone by default,
       # same convention Home Assistant's own docker-compose uses - the runtime image itself has no
